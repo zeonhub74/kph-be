@@ -16,12 +16,9 @@ SUPABASE_ANON_KEY = os.getenv('SUPABASE_ANON_KEY', '')
 SUPABASE_SERVICE_ROLE_KEY = os.getenv('SUPABASE_SERVICE_ROLE_KEY', '')
 ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', 'http://localhost:5173')
 
-if not SUPABASE_URL or not SUPABASE_ANON_KEY or not SUPABASE_SERVICE_ROLE_KEY:
-    raise RuntimeError(
-        'Missing Supabase env vars. Set SUPABASE_URL, SUPABASE_ANON_KEY, and SUPABASE_SERVICE_ROLE_KEY.'
-    )
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+supabase: Optional[Client] = None
+if SUPABASE_URL and SUPABASE_ANON_KEY and SUPABASE_SERVICE_ROLE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 auth_base_url = f"{SUPABASE_URL}/auth/v1"
 
 app = FastAPI(title='KaritonPH API', version='1.0.0')
@@ -98,7 +95,18 @@ def _raise_http_error(message: str, code: int = status.HTTP_400_BAD_REQUEST):
     raise HTTPException(status_code=code, detail=message)
 
 
+def _get_supabase() -> Client:
+    if supabase is None:
+        _raise_http_error(
+            'Supabase is not configured. Set SUPABASE_URL, SUPABASE_ANON_KEY, and '
+            'SUPABASE_SERVICE_ROLE_KEY in the deployment environment.',
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    return supabase
+
+
 async def _auth_request(method: str, endpoint: str, payload: Optional[dict] = None, token: Optional[str] = None):
+    _get_supabase()
     url = f'{auth_base_url}{endpoint}'
     async with httpx.AsyncClient(timeout=20) as client:
         response = await client.request(method, url, json=payload, headers=_auth_headers(token))
@@ -124,7 +132,7 @@ def _extract_token(authorization: Optional[str]) -> str:
 
 
 def _get_user_from_token(token: str) -> dict:
-    user_resp = supabase.auth.get_user(token)
+    user_resp = _get_supabase().auth.get_user(token)
     user_data = getattr(user_resp, 'user', None)
     if not user_data:
         _raise_http_error('Invalid or expired token.', status.HTTP_401_UNAUTHORIZED)
@@ -152,11 +160,12 @@ def _get_profile_seed(user_data: dict) -> dict:
 
 
 def _get_or_create_profile(user_data: dict) -> dict:
-    profile_resp = supabase.table('users').select('*').eq('id', user_data['id']).single().execute()
+    client = _get_supabase()
+    profile_resp = client.table('users').select('*').eq('id', user_data['id']).single().execute()
     if profile_resp.data:
         return profile_resp.data
 
-    created = supabase.table('users').upsert(_get_profile_seed(user_data), on_conflict='id').execute()
+    created = client.table('users').upsert(_get_profile_seed(user_data), on_conflict='id').execute()
     if created.data and len(created.data) > 0:
         return created.data[0]
 
@@ -177,7 +186,7 @@ def _sync_profile_from_auth(user_data: dict, profile: dict) -> dict:
         return profile
 
     updated = (
-        supabase.table('users')
+        _get_supabase().table('users')
         .update(updates)
         .eq('id', profile['id'])
         .execute()
@@ -248,7 +257,7 @@ async def register(body: RegisterBody):
     # or nested under "user" when a session is immediately issued.
     user = result.get('user') or (result if result.get('id') else None)
     if user and user.get('id'):
-        supabase.table('users').upsert(
+        _get_supabase().table('users').upsert(
             {'id': user['id'], 'name': body.name, 'email': body.email, 'role': 'user'},
             on_conflict='id',
         ).execute()
@@ -277,7 +286,7 @@ async def me(current=Depends(get_current_user_profile)):
 @app.get('/api/settings/product-prices')
 def get_product_price_settings():
     data = (
-        supabase.table('product_settings')
+        _get_supabase().table('product_settings')
         .select('is_price_disabled')
         .eq('id', 1)
         .maybe_single()
@@ -293,7 +302,7 @@ def update_product_price_settings(
 ):
     _admin_guard(current['profile'])
     updated = (
-        supabase.table('product_settings')
+        _get_supabase().table('product_settings')
         .upsert({'id': 1, 'is_price_disabled': body.is_price_disabled}, on_conflict='id')
         .execute()
     )
@@ -304,13 +313,13 @@ def update_product_price_settings(
 
 @app.get('/api/products')
 def list_products():
-    data = supabase.table('products').select('*').order('created_at', desc=True).execute()
+    data = _get_supabase().table('products').select('*').order('created_at', desc=True).execute()
     return data.data
 
 
 @app.get('/api/products/{product_id}')
 def get_product(product_id: int):
-    data = supabase.table('products').select('*').eq('id', product_id).single().execute()
+    data = _get_supabase().table('products').select('*').eq('id', product_id).single().execute()
     if not data.data:
         _raise_http_error('Product not found.', status.HTTP_404_NOT_FOUND)
     return data.data
@@ -321,7 +330,7 @@ def create_product(body: ProductCreateBody, current=Depends(get_current_user_pro
     _admin_guard(current['profile'])
     payload = body.model_dump(exclude_none=True)
     payload['price'] = str(payload['price'])
-    created = supabase.table('products').insert(payload).execute()
+    created = _get_supabase().table('products').insert(payload).execute()
     return created.data
 
 
@@ -331,41 +340,41 @@ def update_product(product_id: int, body: ProductUpdateBody, current=Depends(get
     payload = body.model_dump(exclude_none=True)
     if 'price' in payload:
         payload['price'] = str(payload['price'])
-    updated = supabase.table('products').update(payload).eq('id', product_id).execute()
+    updated = _get_supabase().table('products').update(payload).eq('id', product_id).execute()
     return updated.data
 
 
 @app.delete('/api/products/{product_id}')
 def delete_product(product_id: int, current=Depends(get_current_user_profile)):
     _admin_guard(current['profile'])
-    deleted = supabase.table('products').delete().eq('id', product_id).execute()
+    deleted = _get_supabase().table('products').delete().eq('id', product_id).execute()
     return deleted.data
 
 
 @app.get('/api/categories')
 def list_categories():
-    data = supabase.table('categories').select('*').order('name').execute()
+    data = _get_supabase().table('categories').select('*').order('name').execute()
     return data.data
 
 
 @app.post('/api/categories')
 def create_category(body: CategoryCreateBody, current=Depends(get_current_user_profile)):
     _admin_guard(current['profile'])
-    created = supabase.table('categories').insert({'name': body.name}).execute()
+    created = _get_supabase().table('categories').insert({'name': body.name}).execute()
     return created.data
 
 
 @app.put('/api/categories/{category_id}')
 def update_category(category_id: int, body: CategoryUpdateBody, current=Depends(get_current_user_profile)):
     _admin_guard(current['profile'])
-    updated = supabase.table('categories').update({'name': body.name}).eq('id', category_id).execute()
+    updated = _get_supabase().table('categories').update({'name': body.name}).eq('id', category_id).execute()
     return updated.data
 
 
 @app.delete('/api/categories/{category_id}')
 def delete_category(category_id: int, current=Depends(get_current_user_profile)):
     _admin_guard(current['profile'])
-    deleted = supabase.table('categories').delete().eq('id', category_id).execute()
+    deleted = _get_supabase().table('categories').delete().eq('id', category_id).execute()
     return deleted.data
 
 
